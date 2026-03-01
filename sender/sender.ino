@@ -1,264 +1,187 @@
 // ============================================================
 //  NODE SENDER
 // ============================================================
-
 #include <WiFi.h>
 #include <esp_now.h>
+#include <HardwareSerial.h>
 
-//  KONFIGURASI
 uint8_t receiverMacAddress[] = {0x10, 0x52, 0x1c, 0x68, 0xe8, 0xe0};
-#define NODE_ID 1
-#define SEND_INTERVAL 500
+#define NODE_ID          1
+#define SEND_INTERVAL    500
 
 // Pin Timbangan RS232 (Serial2)
-#define SCALE_RX_PIN  16  // GPIO 16 (RX2) ← dari TX MAX3232
-#define SCALE_TX_PIN  17  // GPIO 17 (TX2) → ke RX MAX3232
+#define SCALE_RX_PIN  16
+#define SCALE_TX_PIN  17
 
 // Pin Input Head A
 #define PIN_START_A     32
 #define PIN_TIMER_A     33
-#define PIN_EMERG_A     34  //Perlu Pull-up eksternal 10k!
+#define PIN_EMERG_A     25
 
 // Pin Input Head B
-#define PIN_START_B     35  //Perlu Pull-up eksternal 10k!
-#define PIN_TIMER_B     39  //Perlu Pull-up eksternal 10k!
-#define PIN_EMERG_B     36  //Perlu Pull-up eksternal 10k!
+#define PIN_START_B     26
+#define PIN_TIMER_B     27
+#define PIN_EMERG_B     14
 
-//STRUKTUR DATA
 typedef struct {
-  uint8_t nodeID;           // 1 atau 2
-  float scaleWeight;        // Data timbangan (contoh: 12.50)
-  bool scaleValid;          // true jika data timbangan valid
-
+  uint8_t nodeID;
+  float scaleWeight;
+  bool scaleValid;
+  
   // Head A
   bool headA_start;
   bool headA_timer;
   bool headA_emergency;
-  uint8_t headA_state;      // 0:IDLE, 1:RUN, 2:STOP
 
   // Head B
   bool headB_start;
   bool headB_timer;
   bool headB_emergency;
-  uint8_t headB_state;      // 0:IDLE, 1:RUN, 2:STOP
 
-  unsigned long timestamp;  // Waktu kirim
+  unsigned long timestamp;
 } DataPacket;
 
-//GLOBAL VARIABLES
-HardwareSerial scaleSerial(2);  // Serial2 untuk timbangan
 DataPacket packetData;
 unsigned long lastSendTime = 0;
-unsigned long lastScaleReadTime = 0;
-String scaleBuffer = "";
 
-// State Head (0:IDLE, 1:RUN, 2:STOP)
-uint8_t headA_state = 0;
-uint8_t headB_state = 0;
+#define SerialTimbangan Serial2
 
-//READ Input Digital HEAD A (Active LOW)
-bool readStartA() {
-  //  return digitalRead(PIN_START_A) == LOW;
-  return (random(0, 100) < 10);
-}
-bool readTimerA() {
-  //  return digitalRead(PIN_TIMER_A) == LOW;
-  return (random(0, 100) < 15);  // 15% chance ON
-}
-bool readEmergA() {
-  //  return digitalRead(PIN_EMERG_A) == LOW;
-  return (random(0, 100) < 3);   // 3% chance ON (jarang, karena emergency)
-}
+float bacaBeratKg() {
+  // 1. Pastikan buffer memiliki minimal 6 byte
+  if (SerialTimbangan.available() < 6) return -1;
 
-//READ Input Digital HEAD B (Active LOW)
-bool readStartB() {
-  //  return digitalRead(PIN_START_B) == LOW;
-  return (random(0, 100) < 10);
-}
-bool readTimerB() {
-  //  return digitalRead(PIN_TIMER_B) == LOW;
-  return (random(0, 100) < 15);  // 15% chance ON
-}
-bool readEmergB() {
-  //  return digitalRead(PIN_EMERG_B) == LOW;
-  return (random(0, 100) < 3);   // 3% chance ON (jarang, karena emergency)
-}
-
-// Simulasi berat timbangan (random 0.00 - 50.00 kg)
-float simReadScale() {
-  return (float)random(0, 5000) / 100.0;  // 0.00 sampai 49.99
-}
-
-// ============================================================
-//  FUNGSI: Parse Data Timbangan (masih salah)
-// ============================================================
-//float parseScaleData(String data) {
-//  data.trim();
-//
-//  // Cari angka desimal (format: 12.50 atau 12.50 kg)
-//  String numStr = "";
-//  bool foundDigit = false;
-//
-//  for (int i = 0; i < data.length(); i++) {
-//    char c = data[i];
-//    if (isDigit(c) || c == '.' || c == '-' || c == '+') {
-//      numStr += c;
-//      foundDigit = true;
-//    } else if (foundDigit && c != ' ' && c != 'k' && c != 'g') {
-//      break;  // Stop setelah angka selesai
-//    }
-//  }
-//
-//  if (numStr.length() > 0) {
-//    return numStr.toFloat();
-//  }
-//  return -1.0;  // Invalid
-//}
-
-// ============================================================
-//  FUNGSI: Baca Timbangan (Non-Blocking)
-// ============================================================
-//void readScale() {
-//  while (scaleSerial.available()) {
-//    char c = scaleSerial.read();
-//
-//    if (c == '\n' || c == '\r') {
-//      if (scaleBuffer.length() > 0) {
-//        float weight = parseScaleData(scaleBuffer);
-//        if (weight >= 0) {
-//          packetData.scaleWeight = weight;
-//          packetData.scaleValid = true;
-//        }
-//        scaleBuffer = "";
-//      }
-//    } else {
-//      scaleBuffer += c;
-//      if (scaleBuffer.length() > 20) {
-//        scaleBuffer = "";  // Clear buffer jika terlalu panjang
-//      }
-//    }
-//  }
-//}
-// ============================================================
-
-//Proses Logika Head A
-void processHeadA() {
-  bool emerg = readEmergA();
-  bool start = readStartA();
-  bool timer = readTimerA();
-
-  packetData.headA_emergency = emerg;
-  packetData.headA_start = start;
-  packetData.headA_timer = timer;
-
-  // Logika State Machine
-  if (emerg) {
-    headA_state = 2;  // STOP (Emergency)
-  } else if (start) {
-    headA_state = 1;  // RUN
-  } else if (timer) {
-    headA_state = 1;  // RUN (timer aktif)
-  } else {
-    headA_state = 0;  // IDLE
+  // 2. SINKRONISASI: Byte pertama (Index 0) WAJIB 0xFF sesuai manual
+  if (SerialTimbangan.peek() != 0xFF) {
+    SerialTimbangan.read(); // Buang 1 byte salah, cari 0xFF di putaran berikutnya
+    return -1;
   }
-  packetData.headA_state = headA_state;
+
+  // 3. Baca 6 byte yang sudah pasti diawali 0xFF
+  uint8_t d[6];
+  SerialTimbangan.readBytes(d, 6);
+
+  // --- VALIDASI KETAT SESUAI MANUAL HALAMAN 6 ---
+
+  // A. Cek Mode (Bit 3-4 dari Byte 2): Harus 00 (Mode Weighting)
+  uint8_t mode = (d[1] >> 3) & 0x03;
+  if (mode != 0) return -1; // Abaikan jika timbangan sedang mode counting/persen
+
+  // B. Cek Kestabilan (Bit 6 dari Byte 2): Harus 1 (Stabil)
+  bool isStable = (d[1] >> 6) & 0x01;
+  if (!isStable) return -1; 
+
+  // C. Cek Overflow/Overload (Bit 7 dari Byte 2): Harus 0 (Normal)
+  bool isOverflow = (d[1] >> 7) & 0x01;
+  if (isOverflow) return -1; // Timbangan kelebihan beban (menampilkan --OF--)
+
+  // D. Cek Satuan (Byte 6): Harus 0 (Kg)
+  if (d[5] != 0) return -1; 
+
+  // --- MENGHITUNG BERAT ---
+  auto bcdToUint = [](uint8_t v) {
+    return (uint32_t)(((v >> 4) * 10) + (v & 0x0F));
+  };
+
+  // Gabungkan Byte 3 (LSB), Byte 4 (Mid), Byte 5 (HSB)
+  uint32_t rawWeight = (bcdToUint(d[4]) * 10000) + (bcdToUint(d[3]) * 100) + bcdToUint(d[2]);
+  float berat = (float)rawWeight;
+
+  // --- MENENTUKAN TITIK DESIMAL ---
+  // Bit 0-2 dari Byte 2
+  uint8_t decimalPos = d[1] & 0x07;
+  for (int i = 0; i < decimalPos; i++) {
+    berat /= 10.0;
+  }
+
+  // --- CEK TANDA NEGATIF ---
+  // Bit 5 dari Byte 2: 1 = Negatif
+  bool isNegative = (d[1] >> 5) & 0x01;
+  if (isNegative) berat = -berat;
+
+  return berat;
 }
 
-//Proses Logika Head B
-void processHeadB() {
-  bool emerg = readEmergB();
-  bool start = readStartB();
-  bool timer = readTimerB();
-
-  packetData.headB_emergency = emerg;
-  packetData.headB_start = start;
-  packetData.headB_timer = timer;
-
-  // Logika State Machine
-  if (emerg) {
-    headB_state = 2;  // STOP (Emergency)
-  } else if (start) {
-    headB_state = 1;  // RUN
-  } else if (timer) {
-    headB_state = 1;  // RUN (timer aktif)
-  } else {
-    headB_state = 0;  // IDLE
-  }
-  packetData.headB_state = headB_state;
+void OnDataSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+  // Callback pengiriman
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
 
-  // Inisialisasi random seed dari noise analog
-  randomSeed(analogRead(0));
-
-  // Init Pin Input
   pinMode(PIN_START_A, INPUT_PULLUP);
   pinMode(PIN_TIMER_A, INPUT_PULLUP);
-  pinMode(PIN_EMERG_A, INPUT);  //Perlu Pull-up eksternal 10k!
+  pinMode(PIN_EMERG_A, INPUT_PULLUP);
+  pinMode(PIN_START_B, INPUT_PULLUP);
+  pinMode(PIN_TIMER_B, INPUT_PULLUP);
+  pinMode(PIN_EMERG_B, INPUT_PULLUP);
 
-  pinMode(PIN_START_B, INPUT);  //Perlu Pull-up eksternal 10k!
-  pinMode(PIN_TIMER_B, INPUT);  //Perlu Pull-up eksternal 10k!
-  pinMode(PIN_EMERG_B, INPUT);  //Perlu Pull-up eksternal 10k!
+  SerialTimbangan.begin(9600, SERIAL_8N1, SCALE_RX_PIN, SCALE_TX_PIN);
 
-  // Init Serial2 untuk Timbangan
-  scaleSerial.begin(9600, SERIAL_8N1, SCALE_RX_PIN, SCALE_TX_PIN);
-
-  // Init WiFi & ESP-NOW
   WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) return;
 
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("❌ Error initializing ESP-NOW");
-    return;
-  }
+  esp_now_register_send_cb(OnDataSent);
 
-  // Register Peer (Receiver)
-  esp_now_peer_info_t peerInfo;
-  memset(&peerInfo, 0, sizeof(peerInfo));
+  esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, receiverMacAddress, 6);
-
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("❌ Failed to add peer");
-    return;
-  }
-
-  // Init packet data
-  packetData.nodeID = NODE_ID;
-  packetData.scaleWeight = 0.0;
-  packetData.scaleValid = false;
-  packetData.timestamp = 0;
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X", receiverMacAddress[i]);
-    if (i < 5) Serial.print(":");
-  }
-  Serial.println();
+  esp_now_add_peer(&peerInfo);
 }
 
 void loop() {
-  unsigned long now = millis();
-  // 1. Baca data timbangan (terus menerus)
-  //  readScale();
-  // 1. Simulasi baca timbangan (random weight)
-  packetData.scaleWeight = simReadScale();
-  packetData.scaleValid = true;  // Selalu valid di simulasi
-  
-  // 2. Proses Head
-  processHeadA();
-  processHeadB();
-
-  // 3. Kirim data periodik ke Receiver
   if (millis() - lastSendTime >= SEND_INTERVAL) {
+
+    // 1. Baca Input Fisik
+    bool rawStartA = (digitalRead(PIN_START_A) == LOW);
+    bool rawTimerA = (digitalRead(PIN_TIMER_A) == LOW);
+    bool rawEmergA = (digitalRead(PIN_EMERG_A) == LOW);
+
+    bool rawStartB = (digitalRead(PIN_START_B) == LOW);
+    bool rawTimerB = (digitalRead(PIN_TIMER_B) == LOW);
+    bool rawEmergB = (digitalRead(PIN_EMERG_B) == LOW);
+
+    // 2. Logika Head A (Emergency Priority)
+    packetData.headA_emergency = rawEmergA;
+    if (rawEmergA) {
+      packetData.headA_start = false;
+      packetData.headA_timer = false;
+    } else {
+      packetData.headA_start = rawStartA;
+      packetData.headA_timer = rawTimerA;
+    }
+
+    // 3. Logika Head B (Emergency Priority)
+    packetData.headB_emergency = rawEmergB;
+    if (rawEmergB) {
+      packetData.headB_start = false;
+      packetData.headB_timer = false;
+    } else {
+      packetData.headB_start = rawStartB;
+      packetData.headB_timer = rawTimerB;
+    }
+
+    // 4. Update Timbangan & Metadata
+    packetData.nodeID = NODE_ID;
     packetData.timestamp = millis();
 
-    // Kirim tanpa konfirmasi callback
+    float berat = bacaBeratKg();
+    if (berat >= 0) {
+      packetData.scaleWeight = berat;
+      packetData.scaleValid = true;
+    } else {
+      packetData.scaleValid = false;
+    }
+
+    // 5. Kirim Data
     esp_now_send(receiverMacAddress, (uint8_t *)&packetData, sizeof(DataPacket));
 
+    // 6. Print Ringkas (Format: St-Ti-Em)
+    Serial.printf("W:%.2f | A:[%d-%d-%d] B:[%d-%d-%d]\n", 
+              packetData.scaleWeight,
+              packetData.headA_start, packetData.headA_timer, packetData.headA_emergency,
+              packetData.headB_start, packetData.headB_timer, packetData.headB_emergency);
+                  
     lastSendTime = millis();
   }
-  delay(50);
 }
